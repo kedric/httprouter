@@ -77,13 +77,20 @@
 package httprouter
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"os"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
 )
 
 // Handle is a function that can be registered to a route to handle HTTP
 // requests. Like http.HandlerFunc, but has a third parameter for the values of
 // wildcards (variables).
-type Handle func(http.ResponseWriter, *http.Request, Params)
+// type Handle func(http.ResponseWriter, *http.Request, Params)
+type Handle func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error)
 
 // Param is a single URL parameter, consisting of a key and a value.
 type Param struct {
@@ -232,15 +239,18 @@ func (r *Router) Handle(method, path string, handle Handle) {
 		root = new(node)
 		r.trees[method] = root
 	}
-
+	// if not run on lambda add stage path variable
+	if len(os.Getenv("AWS_EXECUTION_ENV")) == 0 {
+		path = "/:__stage__" + path
+	}
 	root.addRoute(path, handle)
 }
 
 // HandlerFunc is an adapter which allows the usage of an http.HandlerFunc as a
 // request handle.
-func (r *Router) HandlerFunc(method, path string, handler http.HandlerFunc) {
-	r.Handler(method, path, handler)
-}
+// func (r *Router) HandlerFunc(method, path string, handler Handle) {
+// 	r.Handler(method, path, handler)
+// }
 
 // ServeFiles serves files from the given file system root.
 // The path must end with "/*filepath", files are then served from the local
@@ -252,18 +262,18 @@ func (r *Router) HandlerFunc(method, path string, handler http.HandlerFunc) {
 // To use the operating system's file system implementation,
 // use http.Dir:
 //     router.ServeFiles("/src/*filepath", http.Dir("/var/www"))
-func (r *Router) ServeFiles(path string, root http.FileSystem) {
-	if len(path) < 10 || path[len(path)-10:] != "/*filepath" {
-		panic("path must end with /*filepath in path '" + path + "'")
-	}
+// func (r *Router) ServeFiles(path string, root http.FileSystem) {
+// 	if len(path) < 10 || path[len(path)-10:] != "/*filepath" {
+// 		panic("path must end with /*filepath in path '" + path + "'")
+// 	}
 
-	fileServer := http.FileServer(root)
+// 	fileServer := http.FileServer(root)
 
-	r.GET(path, func(w http.ResponseWriter, req *http.Request, ps Params) {
-		req.URL.Path = ps.ByName("filepath")
-		fileServer.ServeHTTP(w, req)
-	})
-}
+// 	r.GET(path, func(w http.ResponseWriter, req *http.Request, ps Params) {
+// 		req.URL.Path = ps.ByName("filepath")
+// 		fileServer.ServeHTTP(w, req)
+// 	})
+// }
 
 func (r *Router) recv(w http.ResponseWriter, req *http.Request) {
 	if rcv := recover(); rcv != nil {
@@ -321,17 +331,35 @@ func (r *Router) allowed(path, reqMethod string) (allow string) {
 	return
 }
 
-// ServeHTTP makes the router implement the http.Handler interface.
+// func (r *Router) ServeHTTP(wHttp http.ResponseWriter, reqHttp *http.Request) {
+// 	e, err := RequestToLambda(reqHttp)
+// 	if err != nil {
+// 		return
+// 	}
+// 	res, err := r.ServeLambda(context.Background(), e)
+// 	wHttp.WriteHeader(res.StatusCode)
+// 	wHttp.Write([]byte(res.Body))
+// }
+
+// // ServeHTTP makes the router implement the http.Handler interface.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if r.PanicHandler != nil {
 		defer r.recv(w, req)
 	}
-
+	e, err := RequestToLambda(req)
+	if err != nil {
+		return
+	}
 	path := req.URL.Path
 
 	if root := r.trees[req.Method]; root != nil {
-		if handle, ps, tsr := root.getValue(path); handle != nil {
-			handle(w, req, ps)
+		if handle, params, tsr := root.getValue(path); handle != nil {
+
+			responce, err := handle(context.Background(), HttpAddParams(e, params))
+			if err != nil {
+				fmt.Printf("Error: %s\n", err.Error())
+			}
+			ResToHttp(w, req, responce)
 			return
 		} else if req.Method != "CONNECT" && path != "/" {
 			code := 301 // Permanent redirect, request with GET method
@@ -395,5 +423,90 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.NotFound.ServeHTTP(w, req)
 	} else {
 		http.NotFound(w, req)
+	}
+}
+
+func (r *Router) ServeLambda(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	// if r.PanicHandler != nil {
+	// 	defer r.recv(w, req)
+	// }
+
+	path := req.Path
+
+	if root := r.trees[req.HTTPMethod]; root != nil {
+		if handle, _, tsr := root.getValue(path); handle != nil {
+
+			return handle(ctx, req)
+
+		} else if req.HTTPMethod != "CONNECT" && path != "/" {
+			code := 301 // Permanent redirect, request with GET method
+			if req.HTTPMethod != "GET" {
+				// Temporary redirect, request with same method
+				// As of Go 1.3, Go does not support status code 308.
+				code = 307
+			}
+
+			if tsr && r.RedirectTrailingSlash {
+				newPath := ""
+				if len(path) > 1 && path[len(path)-1] == '/' {
+					newPath = path[:len(path)-1]
+				} else {
+					newPath = path + "/"
+				}
+				return LambdaRedirect(ctx, req, newPath, code)
+			}
+
+			// Try to fix the request path
+			if r.RedirectFixedPath {
+				fixedPath, found := root.findCaseInsensitivePath(
+					CleanPath(path),
+					r.RedirectTrailingSlash,
+				)
+				if found {
+					return LambdaRedirect(ctx, req, string(fixedPath), code)
+				}
+			}
+		}
+	}
+
+	if req.HTTPMethod == "OPTIONS" && r.HandleOPTIONS {
+		// Handle OPTIONS requests
+		if allow := r.allowed(path, req.HTTPMethod); len(allow) > 0 {
+			// w.Header().Set("Allow", allow)
+			return LambdaAllow(ctx, req, allow)
+		}
+	} else {
+		// Handle 405
+		if r.HandleMethodNotAllowed {
+			if allow := r.allowed(path, req.HTTPMethod); len(allow) > 0 {
+				// w.Header().Set("Allow", allow)
+				return LambdaNotAllowed(ctx, req, allow)
+				// if r.MethodNotAllowed != nil {
+				// 	r.MethodNotAllowed.ServeHTTP(w, req)
+				// } else {
+				// 	http.Error(w,
+				// 		http.StatusText(http.StatusMethodNotAllowed),
+				// 		http.StatusMethodNotAllowed,
+				// 	)
+				// }
+				// return
+			}
+		}
+	}
+	return LambdaNotFound(ctx, req)
+	// Handle 404
+	// if r.NotFound != nil {
+	// 	r.NotFound.ServeHTTP(w, req)
+	// } else {
+	// 	http.NotFound(w, req)
+	// }
+}
+
+func (r *Router) Serve(port string) error {
+	if len(os.Getenv("AWS_EXECUTION_ENV")) == 0 {
+		return http.ListenAndServe(port, r)
+	} else {
+		lambda.Start(r.ServeLambda)
+		return nil
 	}
 }
